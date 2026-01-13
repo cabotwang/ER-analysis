@@ -725,9 +725,15 @@ calculate_risk_ratios <- function(model, reference_values, comparison_scenarios)
     stop("reference_values must be a named list or a 1-row data.frame")
   }
 
+  # 仅使用模型中的协变量列做预测/对比，避免 reference_values 里带 label 等辅助列导致 predict 失败
+  model_formula <- formula(model)
+  response_var <- as.character(model_formula[[2]])
+  model_covars <- setdiff(all.vars(model_formula), response_var)
+
   # 计算参考情况的风险
   # 直接使用reference_values
-  ref_result <- predict_risk_with_ci(model, reference_values)
+  ref_pred_data <- reference_values[, model_covars, drop = FALSE]
+  ref_result <- predict_risk_with_ci(model, ref_pred_data)
   
   # 存储结果
   results_table <- data.frame(
@@ -750,8 +756,7 @@ calculate_risk_ratios <- function(model, reference_values, comparison_scenarios)
     scenario <- comparison_scenarios[i, ]
     
     # 计算当前情况的风险
-    # 仅传入reference_values对应的列，避免带入无关字段导致predict失败
-    curr_pred_data <- scenario[, names(reference_values), drop = FALSE]
+    curr_pred_data <- scenario[, model_covars, drop = FALSE]
     
     curr_result <- predict_risk_with_ci(model, curr_pred_data)
     
@@ -766,7 +771,7 @@ calculate_risk_ratios <- function(model, reference_values, comparison_scenarios)
     covname <- character()
     label <- character()
     print(curr_result)
-    for (var_name in names(reference_values)) {
+    for (var_name in model_covars) {
       if (scenario[[var_name]] != reference_values[[var_name]]) {
         covname <- c(covname, var_name)
         label <- c(label, as.character(scenario[[var_name]]))
@@ -781,6 +786,14 @@ calculate_risk_ratios <- function(model, reference_values, comparison_scenarios)
       # 将多个差异合并为一个字符串
       covname <- paste(covname, collapse = " + ")
       label <- paste(label, collapse = " vs ")
+    }
+
+    # 如果 comparison_scenarios 自带 covname/label，则优先用它们（用于自动生成展示标签）
+    if ("covname" %in% names(scenario) && !is.na(scenario[["covname"]])) {
+      covname <- as.character(scenario[["covname"]])
+    }
+    if ("label" %in% names(scenario) && !is.na(scenario[["label"]])) {
+      label <- as.character(scenario[["label"]])
     }
     
     # 添加到结果表
@@ -918,14 +931,10 @@ make_reference_and_scenarios <- function(data,
     }
   }
   reference_values <- as.data.frame(ref_row, stringsAsFactors = FALSE)
+  reference_values$label <- "Reference"
 
   # 比较场景：每次只改变一个变量，其它变量固定为 reference_values
   rows <- list()
-  scenario_meta <- data.frame(
-    covname = character(),
-    label = character(),
-    stringsAsFactors = FALSE
-  )
   # - 连续变量：改变到除 reference_prob 外的分位数
   scenario_probs <- probs[probs != reference_prob]
   for (v in vars) {
@@ -935,15 +944,9 @@ make_reference_and_scenarios <- function(data,
         row <- reference_values
         new_val <- unname(quantiles[[v]][[p_name]])
         row[[v]] <- new_val
+        row$covname <- v
+        row$label <- sprintf("%02dth:%s", as.integer(p * 100), signif(new_val, 3))
         rows[[length(rows) + 1]] <- row
-        scenario_meta <- rbind(
-          scenario_meta,
-          data.frame(
-            covname = v,
-            label = sprintf("%02dth:%s", as.integer(p * 100), signif(new_val, 3)),
-            stringsAsFactors = FALSE
-          )
-        )
       }
     } else {
       # - 分类变量：reference 为众数；比较场景为除众数外的所有水平
@@ -959,22 +962,15 @@ make_reference_and_scenarios <- function(data,
         } else {
           row[[v]] <- lv
         }
+        row$covname <- v
+        row$label <- as.character(lv)
         rows[[length(rows) + 1]] <- row
-        scenario_meta <- rbind(
-          scenario_meta,
-          data.frame(
-            covname = v,
-            label = as.character(lv),
-            stringsAsFactors = FALSE
-          )
-        )
       }
     }
   }
 
   comparison_scenarios <- do.call(rbind, rows)
   rownames(comparison_scenarios) <- NULL
-  attr(comparison_scenarios, "scenario_meta") <- scenario_meta
 
   list(
     quantiles = quantiles,
@@ -1005,11 +1001,6 @@ WT_result <- er_inputs$quantiles[["BW"]]
 reference_values <- er_inputs$reference_values
 comparison_scenarios <- er_inputs$comparison_scenarios
 risk_ratios_table <- calculate_risk_ratios(G3_P_AE_model, reference_values, comparison_scenarios) 
-scenario_meta <- attr(comparison_scenarios, "scenario_meta")
-if (!is.null(scenario_meta) && nrow(scenario_meta) == nrow(risk_ratios_table)) {
-  risk_ratios_table$covname <- scenario_meta$covname
-  risk_ratios_table$label <- scenario_meta$label
-}
 p_PFS <- generate_forest_plot(paramname = "PFS", risk_ratios_table)
 
 
