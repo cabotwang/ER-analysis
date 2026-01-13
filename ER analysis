@@ -865,19 +865,64 @@ predict(G3_P_AE_model, newdata = reference_values, se.fit = TRUE)
 # AST分位数：15, 19, 24.9, 35, 57.54
 # BW 分位数：45.6，54，61，68，81.52
 
-probs = c(0.05, 0.25, 0.5, 0.75, 0.95)
-Cavg_G3_P_AE_result <-  quantile(data_sf_toxin_processed[["Cavg_G3_P_AE"]], probs = probs, na.rm = TRUE)
-AST_result <- quantile(data_sf_toxin_processed[["AST"]], probs = probs, na.rm = TRUE)
-WT_result <-  quantile(data_sf_toxin_processed[["BW"]], probs = probs, na.rm = TRUE)
+make_reference_and_scenarios <- function(data,
+                                         vars,
+                                         probs = c(0.05, 0.25, 0.5, 0.75, 0.95),
+                                         reference_prob = 0.5,
+                                         na.rm = TRUE) {
+  # 计算每个变量在指定probs下的分位数
+  quantiles <- lapply(vars, \(v) quantile(data[[v]], probs = probs, na.rm = na.rm))
+  names(quantiles) <- vars
 
-# 定义参考值和比较情况
-reference_values <- list(Cavg_G3_P_AE = 0.80, AST = 24.9, BW = 61)
-comparison_scenarios <- data.frame(
-  Cavg_G3_P_AE = c(0.39,0.61,1.11,2.15,0.80, 0.80,0.80,0.80,0.80,0.80,0.80,0.80),
-  AST = c(24.9,24.9,24.9,24.9,15, 19, 35, 57.54,24.9,24.9,24.9,24.9),
-  BW = c(61,61,61,61,61,61,61,61,45.6,54, 68,81.52),
-  stringsAsFactors = FALSE
+  # 参考值：默认取reference_prob(例如50%)分位数
+  ref_name <- paste0(reference_prob * 100, "%")
+  reference_values <- as.data.frame(
+    setNames(
+      lapply(vars, \(v) unname(quantiles[[v]][[ref_name]])),
+      vars
+    ),
+    stringsAsFactors = FALSE
+  )
+
+  # 比较场景：每次只改变一个变量到其它分位数，其它变量固定为参考值
+  scenario_probs <- probs[probs != reference_prob]
+  rows <- vector("list", length(vars) * length(scenario_probs))
+  idx <- 1
+  for (v in vars) {
+    for (p in scenario_probs) {
+      p_name <- paste0(p * 100, "%")
+      row <- reference_values
+      row[[v]] <- unname(quantiles[[v]][[p_name]])
+      rows[[idx]] <- row
+      idx <- idx + 1
+    }
+  }
+  comparison_scenarios <- do.call(rbind, rows)
+  rownames(comparison_scenarios) <- NULL
+
+  list(
+    quantiles = quantiles,
+    reference_values = reference_values,
+    comparison_scenarios = comparison_scenarios
+  )
+}
+
+probs <- c(0.05, 0.25, 0.5, 0.75, 0.95)
+er_inputs <- make_reference_and_scenarios(
+  data = data_sf_toxin_processed,
+  vars = c("Cavg_G3_P_AE", "AST", "BW"),
+  probs = probs,
+  reference_prob = 0.5
 )
+
+# 保留原有变量名，方便后续沿用
+Cavg_G3_P_AE_result <- er_inputs$quantiles[["Cavg_G3_P_AE"]]
+AST_result <- er_inputs$quantiles[["AST"]]
+WT_result <- er_inputs$quantiles[["BW"]]
+
+# 自动生成参考值和比较场景
+reference_values <- er_inputs$reference_values
+comparison_scenarios <- er_inputs$comparison_scenarios
 risk_ratios_table <- calculate_risk_ratios(G3_P_AE_model, reference_values, comparison_scenarios) 
 risk_ratios_table <- risk_ratios_table %>% mutate(label = case_when(
   label == 50.06~ '95th:50.06',
