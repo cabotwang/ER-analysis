@@ -940,7 +940,7 @@ make_reference_and_scenarios <- function(data,
           scenario_meta,
           data.frame(
             covname = v,
-            label = sprintf("%sth:%s", as.integer(p * 100), signif(new_val, 3)),
+            label = sprintf("%02dth:%s", as.integer(p * 100), signif(new_val, 3)),
             stringsAsFactors = FALSE
           )
         )
