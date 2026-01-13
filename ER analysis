@@ -865,19 +865,116 @@ predict(G3_P_AE_model, newdata = reference_values, se.fit = TRUE)
 # AST分位数：15, 19, 24.9, 35, 57.54
 # BW 分位数：45.6，54，61，68，81.52
 
-probs = c(0.05, 0.25, 0.5, 0.75, 0.95)
-Cavg_G3_P_AE_result <-  quantile(data_sf_toxin_processed[["Cavg_G3_P_AE"]], probs = probs, na.rm = TRUE)
-AST_result <- quantile(data_sf_toxin_processed[["AST"]], probs = probs, na.rm = TRUE)
-WT_result <-  quantile(data_sf_toxin_processed[["BW"]], probs = probs, na.rm = TRUE)
+make_reference_and_scenarios <- function(data,
+                                         vars,
+                                         var_type_list = list(continuous = character(0), categorical = character(0)),
+                                         probs = c(0.05, 0.25, 0.5, 0.75, 0.95),
+                                         reference_prob = 0.5,
+                                         na.rm = TRUE) {
+  # 连续/分类变量判定：优先使用 var_type_list，其次用数据类型兜底
+  is_continuous <- function(v) {
+    if (!is.null(var_type_list$continuous) && v %in% var_type_list$continuous) return(TRUE)
+    if (!is.null(var_type_list$categorical) && v %in% var_type_list$categorical) return(FALSE)
+    is.numeric(data[[v]]) || is.integer(data[[v]])
+  }
 
-# 定义参考值和比较情况
-reference_values <- list(Cavg_G3_P_AE = 0.80, AST = 24.9, BW = 61)
-comparison_scenarios <- data.frame(
-  Cavg_G3_P_AE = c(0.39,0.61,1.11,2.15,0.80, 0.80,0.80,0.80,0.80,0.80,0.80,0.80),
-  AST = c(24.9,24.9,24.9,24.9,15, 19, 35, 57.54,24.9,24.9,24.9,24.9),
-  BW = c(61,61,61,61,61,61,61,61,45.6,54, 68,81.52),
-  stringsAsFactors = FALSE
+  # 众数（分类变量 reference）
+  get_mode <- function(x) {
+    if (na.rm) x <- x[!is.na(x)]
+    if (length(x) == 0) return(NA)
+    tab <- sort(table(x), decreasing = TRUE)
+    names(tab)[[1]]
+  }
+
+  # 计算连续变量分位数
+  cont_vars <- vars[vapply(vars, is_continuous, logical(1))]
+
+  quantiles <- list()
+  if (length(cont_vars) > 0) {
+    quantiles <- lapply(cont_vars, \(v) quantile(data[[v]], probs = probs, na.rm = na.rm))
+    names(quantiles) <- cont_vars
+  }
+
+  # 构建 reference_values（一行 data.frame）：连续变量用 reference_prob 分位数；分类变量用众数
+  ref_row <- list()
+  ref_name <- paste0(reference_prob * 100, "%")
+  for (v in vars) {
+    if (is_continuous(v)) {
+      ref_row[[v]] <- unname(quantiles[[v]][[ref_name]])
+    } else {
+      mode_val <- get_mode(data[[v]])
+      # 如果训练数据是 factor，确保 newdata 的 levels 匹配
+      if (is.factor(data[[v]])) {
+        ref_row[[v]] <- factor(mode_val, levels = levels(data[[v]]))
+      } else {
+        ref_row[[v]] <- mode_val
+      }
+    }
+  }
+  reference_values <- as.data.frame(ref_row, stringsAsFactors = FALSE)
+
+  # 比较场景：每次只改变一个变量，其它变量固定为 reference_values
+  rows <- list()
+  # - 连续变量：改变到除 reference_prob 外的分位数
+  scenario_probs <- probs[probs != reference_prob]
+  for (v in vars) {
+    if (is_continuous(v)) {
+      for (p in scenario_probs) {
+        p_name <- paste0(p * 100, "%")
+        row <- reference_values
+        row[[v]] <- unname(quantiles[[v]][[p_name]])
+        rows[[length(rows) + 1]] <- row
+      }
+    } else {
+      # - 分类变量：reference 为众数；比较场景为除众数外的所有水平
+      mode_val <- as.character(reference_values[[v]][[1]])
+      levels_all <- unique(data[[v]])
+      if (na.rm) levels_all <- levels_all[!is.na(levels_all)]
+      levels_all <- as.character(levels_all)
+      other_levels <- setdiff(levels_all, mode_val)
+      for (lv in other_levels) {
+        row <- reference_values
+        if (is.factor(data[[v]])) {
+          row[[v]] <- factor(lv, levels = levels(data[[v]]))
+        } else {
+          row[[v]] <- lv
+        }
+        rows[[length(rows) + 1]] <- row
+      }
+    }
+  }
+
+  comparison_scenarios <- do.call(rbind, rows)
+  rownames(comparison_scenarios) <- NULL
+
+  list(
+    quantiles = quantiles,
+    reference_values = reference_values,
+    comparison_scenarios = comparison_scenarios
+  )
+}
+
+probs <- c(0.05, 0.25, 0.5, 0.75, 0.95)
+er_inputs <- make_reference_and_scenarios(
+  data = data_sf_toxin_processed,
+  vars = c("Cavg_G3_P_AE", "AST", "BW"),
+  # 通过list显式指定变量类型（分类变量会取众数为reference，并生成除众数外的对比水平）
+  var_type_list = list(
+    continuous = c("Cavg_G3_P_AE", "AST", "BW"),
+    categorical = character(0)
+  ),
+  probs = probs,
+  reference_prob = 0.5
 )
+
+# 保留原有变量名，方便后续沿用
+Cavg_G3_P_AE_result <- er_inputs$quantiles[["Cavg_G3_P_AE"]]
+AST_result <- er_inputs$quantiles[["AST"]]
+WT_result <- er_inputs$quantiles[["BW"]]
+
+# 自动生成参考值和比较场景
+reference_values <- er_inputs$reference_values
+comparison_scenarios <- er_inputs$comparison_scenarios
 risk_ratios_table <- calculate_risk_ratios(G3_P_AE_model, reference_values, comparison_scenarios) 
 risk_ratios_table <- risk_ratios_table %>% mutate(label = case_when(
   label == 50.06~ '95th:50.06',
