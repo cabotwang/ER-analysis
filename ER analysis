@@ -861,10 +861,6 @@ G3_P_AE_model <- glm(G3_P_AE ~ Cavg_G3_P_AE + AST + BW, family = "binomial", dat
 predict(G3_P_AE_model, newdata = reference_values, se.fit = TRUE)
 
 # 使用通用函数计算
-# Cavg_G3_P_AE分位数：0.39,0.61,0.80,1.11,2.15
-# AST分位数：15, 19, 24.9, 35, 57.54
-# BW 分位数：45.6，54，61，68，81.52
-
 make_reference_and_scenarios <- function(data,
                                          vars,
                                          var_type_list = list(continuous = character(0), categorical = character(0)),
@@ -967,11 +963,6 @@ er_inputs <- make_reference_and_scenarios(
   reference_prob = 0.5
 )
 
-# 保留原有变量名，方便后续沿用
-Cavg_G3_P_AE_result <- er_inputs$quantiles[["Cavg_G3_P_AE"]]
-AST_result <- er_inputs$quantiles[["AST"]]
-WT_result <- er_inputs$quantiles[["BW"]]
-
 # 自动生成参考值和比较场景
 reference_values <- er_inputs$reference_values
 comparison_scenarios <- er_inputs$comparison_scenarios
@@ -990,9 +981,6 @@ p_PFS <- generate_forest_plot(paramname = "PFS", risk_ratios_table)
 #HEMA_G3_P~Cavg_HEMA_G3_P + HGB + ALB + AST
 #PLTD_G3_P~Cavg_PLTD_G3_P + NST + RTH
 #GI~Cavg_GI + AST
-
-
-
 
 
 
