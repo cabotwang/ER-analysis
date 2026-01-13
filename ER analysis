@@ -1,0 +1,921 @@
+rm(list=ls())
+library(PKNCA)
+library(dplyr)
+library(ggplot2)
+library(survival)
+library(survminer)
+library(coveffectsplot)
+library(tidyr)
+library(stringr)
+
+root <- 'C:\\Users\\wangs104\\OneDrive - HENGRUI\\SHR-A1811\\7 Regulatory Submissions and Communications\\3 NDA\\CRC_SHR-A1811-309\\NDA_Package\\ER'
+setwd(file.path(root, 'Rcode'))
+ER_sf_Path_adc <-  paste0(root, "\\dataset\\ER_SAFETY_SHR-A1811_1Jan2026.csv") 
+ER_sf_Path_toxin <-  paste0(root, "\\dataset\\ER_SAFETY_SHR169265_1Jan2026.csv")
+ER_eff_Path_adc <-  paste0(root, "\\dataset\\ER_EFF_SHR-A1811_1Jan2026.csv")
+ER_eff_Path_toxin <- paste0(root, "\\dataset\\ER_EFF_SHR169265_1Jan2026.csv")
+
+
+data_EFF_adc <- read.csv(ER_eff_Path_adc)  %>% mutate(PFS_CENS = 1-as.numeric(PFS_CENS), OS_CENS = 1- as.numeric(OS_CENS), DOR_CENS = 1- as.numeric(DOR_CENS))
+data_EFF_toxin <- read.csv(ER_eff_Path_toxin) %>% mutate(PFS_CENS = 1-as.numeric(PFS_CENS), OS_CENS = 1- as.numeric(OS_CENS), DOR_CENS = 1- as.numeric(DOR_CENS))
+data_sf_adc <- read.csv(ER_sf_Path_adc)
+data_sf_toxin <- read.csv(ER_sf_Path_toxin)
+
+# 汇总统计人数--------------
+st_summary <- data_EFF_adc %>% group_by(ST, DOGROUP) %>%
+  summarise(N= n())
+st_summary_1 <- data_EFF_adc %>% group_by(ST) %>%
+  summarise(N= n())
+st_summary <- data_sf_adc %>% group_by(ST, DOGROUP) %>%
+  summarise(N= n())
+st_summary_1 <- data_sf_adc %>% group_by(ST) %>%
+  summarise(N= n())
+
+# PK 参数描述性统计-----------
+format_geostat <- function(x) {
+  sprintf(
+    "%s (%s)",
+    signif(geomean(x), 3) %>% format(drop0trailing = TRUE),
+    signif(geocv(x), 3) %>% format(drop0trailing = TRUE)
+  )
+}
+pkp_summary<- function(data, pkp_list){
+  gdata <-  data %>% group_by(ST, DOGROUP) %>%
+    group_by(ST, DOGROUP) %>%
+    summarise(N= n(),
+              across(
+                .cols = all_of(pkp_list),
+                .fns  = ~ format_geostat(.x),
+                .names = "{.col}_GeoStat"
+              ),
+              .groups = "drop"
+    )
+}
+data_adc_sm <- pkp_summary(data_sf_adc, c('CmaxFD_ADC', 'CminFD_ADC', 'AUCFD_ADC', 'Cmaxss_ADC', 'Cminss_ADC', 'AUCss_ADC'))
+data_toxin_sm <- pkp_summary(data_sf_toxin, c('CmaxFD_TOXIN', 'CminFD_TOXIN', 'AUCFD_TOXIN', 'Cmaxss_TOXIN', 'Cminss_TOXIN', 'AUCss_TOXIN'))
+write.csv(data_adc_sm, 'Table/PKP_summary_ADC.csv',row.names = FALSE)
+write.csv(data_toxin_sm, 'Table/PKP_summary_toxin.csv',row.names = FALSE)
+
+##ER分析函数
+plot_ER <- function(dat=data,rsp=response,exp=exposure,xlabs,ylabs,dose,note="")
+{
+  dat <- dat %>%
+    filter(!is.na(!!sym(rsp)) & !!sym(rsp) != '.' & !!sym(rsp) != '',
+           !is.na(!!sym(exp)) & !!sym(exp) != '.' & !!sym(exp) != '',
+           !is.na(!!sym(dose)) & !!sym(dose) != '.' & !!sym(dose) != '') %>%
+    # 将response和exposure转换为数值型
+    mutate(!!rsp := as.numeric(!!sym(rsp)),
+           !!exp := as.numeric(!!sym(exp)),
+           !!dose := as.factor(!!sym(dose)))
+  
+  quantile_range <- function(x, probs = c(0.25, 0.5, 0.75)) {
+    quant <- quantile(x, probs)
+    n <- length(probs)
+    sapply(x, \(y) {
+      for (i in 1:n) {
+        if (y <= quant[i]) {
+          return(paste0(ifelse(i == 1, 0, probs[i - 1]), '-', probs[i]))}}
+      return(paste0(probs[n], '-1'))})}
+  N = count(dat)
+  # 基准模型（只包含截距项）
+  null_model <- glm(as.formula(paste0(rsp, "~ 1")), family = "binomial", data = dat)
+  # 完整模型
+  fit <- glm(as.formula(paste0(rsp, "~", exp)), family = "binomial", data = dat)
+  # 似然比检验
+  lrt_result <- anova(null_model, fit, test = "Chisq")
+  pval <- format(lrt_result$`Pr(>Chi)`[2], scientific = T, digits = 3)
+  dat$PRED <- predict(fit, newdata = dat, type = "response", se.fit = FALSE)
+  dat$QUANTILE <- quantile_range(dat[[exp]], probs = c(0.25, 0.5, 0.75))
+  dat_tj <- dat %>% group_by(QUANTILE) %>% 
+    summarise(Sucess=sum(!!rlang::sym(rsp)),
+              Total=n(),
+              EXP_MEDIAN=median(!!sym(exp))) 
+  stats <- dat_tj %>% group_by(QUANTILE) %>% 
+    summarise(Est=as.numeric(binom.test(Sucess,Total)$estimate),
+              LCI=as.numeric(binom.test(Sucess,Total)$conf.int)[1],
+              UCI=as.numeric(binom.test(Sucess,Total)$conf.int)[2],
+              EXP_MEDIAN=EXP_MEDIAN)
+  p0 <- ggplot(dat, aes(x = !!sym(exp), y = !!sym(rsp)))+
+    geom_point(aes(colour = !!sym(rsp), fill = "red"),shape=21, size = 3) +theme(legend.title = element_blank())+
+    geom_errorbar(aes(x = EXP_MEDIAN, y = Est, ymin = LCI, ymax = UCI),data = stats, width = diff(range(dat[[exp]])) / 30, col = "red")+
+    geom_point(data = stats, aes(x = EXP_MEDIAN, y = Est),shape=1)+
+    stat_smooth(method = "glm", method.args = list(family = "binomial"), se = TRUE, col="red")+
+    xlab(xlabs) + 
+    ylab(ylabs) +
+    ggtitle(paste0(rsp,"~",exp,"("," P value:",pval,")")) +
+    theme(axis.text = element_text(size = 14),
+          axis.title = element_text(size = 14),
+          title = element_text(size = 14),
+          legend.title = element_text(size = 14),
+          legend.text = element_text(size = 14),
+          legend.position = "center",
+          legend.direction = "horizontal",
+          legend.justification = c("right", "bottom"),
+          legend.key.size = unit(6, units = 'pt'),
+          legend.margin = margin(0, 2, 2, 2))
+  {p1 <- ggplot(dat, aes(!!sym(dose), !!sym(exp), fill = !!sym(dose))) +
+      stat_boxplot(geom = "errorbar", width = 0.5) + 
+      geom_boxplot(outlier.alpha = 0)+ylab("") + 
+      geom_jitter(shape=16, position = position_jitter(0.1))+
+      coord_flip()+
+      theme(legend.position = "none",
+            axis.title.x = element_blank(),
+            axis.text = element_text(size = 14),
+            axis.title = element_text(size = 14),
+            panel.grid.minor = element_blank(),
+            panel.grid.major = element_blank())
+    limits <- range(dat[[exp]])
+    filename <- sprintf("%s_%s_%s.png",rsp, exp, note) 
+    p <- ggpubr::ggarrange(p0+xlim(limits), p1+ylim(limits), ncol = 1, nrow = 2,heights = c(2.5,1), align = "v")
+    #ggsave(file.path(root, "Picture", "ER_plot", filename), p, width = 9, height = 10)
+    return(p)} 
+}
+
+
+data_EFF_adc_101_102 <- data_EFF_adc %>% filter(ST %in% c('SHR-A1811-I-101', 'SHR-A1811-I-102'))
+data_EFF_adc_309 <- data_EFF_adc %>% filter(ST %in% c('SHR-A1811-309'))
+data_EFF_toxin_101_102 <- data_EFF_toxin %>% filter(ST %in% c('SHR-A1811-I-101', 'SHR-A1811-I-102'))
+data_EFF_toxin_309 <- data_EFF_toxin %>% filter(ST %in% c('SHR-A1811-309'))
+
+
+# 有效性分析--------------------------
+# 102+101 研究
+P1<- plot_ER(data_EFF_adc_101_102,'OR','Cavg_OR', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP', '101_102')
+P2<- plot_ER(data_EFF_adc_101_102,'OR','Cavg_ADC', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP', '101_102')
+P3<- plot_ER(data_EFF_adc_101_102,'OR','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP', '101_102')
+P4<- plot_ER(data_EFF_adc_101_102,'OR','CminFD_ADC', 'Cmin of ADC (ug/ml)', 'Probility', 'DOGROUP', '101_102')
+P5<- plot_ER(data_EFF_adc_101_102,'OR','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP', '101_102')
+P6<- plot_ER(data_EFF_adc_101_102,'OR','Cminss_ADC', 'Cmin of ADC (ug/ml)', 'Probility', 'DOGROUP', '101_102')
+
+p_final <- ggpubr::ggarrange(P1,P2,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'OR_ADC_sum_101_102.png'), p_final, width = 15, height = 10)
+
+P1<- plot_ER(data_EFF_toxin_101_102,'OR','Cavg_OR', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP', '101_102')
+P2<- plot_ER(data_EFF_toxin_101_102,'OR','Cavg_TOXIN', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP', '101_102')
+P3<- plot_ER(data_EFF_toxin_101_102,'OR','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP', '101_102')
+P4<- plot_ER(data_EFF_toxin_101_102,'OR','CminFD_TOXIN', 'Cmin of toxin (ng/ml)', 'Probility', 'DOGROUP', '101_102')
+P5<- plot_ER(data_EFF_toxin_101_102,'OR','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP', '101_102')
+P6<- plot_ER(data_EFF_toxin_101_102,'OR','Cminss_TOXIN', 'Cmin of toxin (ng/ml)', 'Probility', 'DOGROUP', '101_102')
+
+p_final <- ggpubr::ggarrange(P1,P2,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'OR_toxin_sum_101_102.png'), p_final, width = 15, height = 10)
+
+
+# 309 研究
+P1<- plot_ER(data_EFF_adc_309,'OR','Cavg_OR', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP', '309')
+P2<- plot_ER(data_EFF_adc_309,'OR','Cavg_ADC', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP', '309')
+P3<- plot_ER(data_EFF_adc_309,'OR','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP', '309')
+P4<- plot_ER(data_EFF_adc_309,'OR','CminFD_ADC', 'Cmin of ADC (ug/ml)', 'Probility', 'DOGROUP', '309')
+P5<- plot_ER(data_EFF_adc_309,'OR','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP', '309')
+P6<- plot_ER(data_EFF_adc_309,'OR','Cminss_ADC', 'Cmin of ADC (ug/ml)', 'Probility', 'DOGROUP', '309')
+
+p_final <- ggpubr::ggarrange(P1,P2,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'OR_ADC_sum_309.png'), p_final, width = 15, height = 10)
+
+P1<- plot_ER(data_EFF_adc_309,'OR','Cavg_OR', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P2<- plot_ER(data_EFF_adc_309,'OR','Cavg_TOXIN', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_EFF_adc_309,'OR','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_EFF_adc_309,'OR','CminFD_TOXIN', 'Cmin of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_EFF_adc_309,'OR','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_EFF_adc_309,'OR','Cavg_TOXIN', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+
+P3<- plot_ER(data_EFF_adc_309,'OR','Cminss_TOXIN', 'Cmin of toxin (ng/ml)', 'Probility', 'DOGROUP')
+
+p_final <- ggpubr::ggarrange(P1,P2,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'OR_toxin_sum_309.png'), p_final, width = 15, height = 10)
+
+
+
+##PFS,OS--------------------
+Surv_strata <- function(data, exp, rsp.time, rsp.event, 
+                        explab = NULL, xlab = NULL,
+                        n_quantiles = 4) {  # 新增分位数参数
+  rlang::inform(paste(exp, rsp.time, rsp.event))
+  
+  dat <- data |>
+    select(all_of(c(rsp.time, rsp.event, exp))) %>%
+    filter(!!sym(exp) != ".", 
+           !!sym(rsp.time) != ".", 
+           !!sym(rsp.event) != ".")%>%
+    mutate(!!exp := as.numeric(!!sym(exp)),
+           !!rsp.time := as.numeric(!!sym(rsp.time)),
+           !!rsp.event := as.numeric(!!sym(rsp.event)))
+  
+  # 根据n_quantiles生成分位点
+  quantile_breaks <- seq(0, 1, length.out = n_quantiles + 1)
+  dat$QUANTILE <- cut(dat[[exp]], 
+                      quantile(dat[[exp]], quantile_breaks),
+                      include.lowest = T)
+  
+  # 生成分位标签
+  quantile_labels <- paste0(
+    ifelse(1:n_quantiles == 1, "[", "("),
+    (0:(n_quantiles-1))*100/n_quantiles,
+    "-",
+    (1:n_quantiles)*100/n_quantiles,
+    ifelse(1:n_quantiles == 1, "]", "]"),
+    "%"
+  )
+  dat$QUANTILE <- factor(dat$QUANTILE, labels = quantile_labels, ordered = TRUE)
+  
+  fit.quantile <- surv_fit(Surv(dat[[rsp.time]], dat[[rsp.event]]) ~ QUANTILE, data = dat)
+  
+  # 对数秩和检验（log-rank test）
+  surv_diff <- survdiff(Surv(dat[[rsp.time]], dat[[rsp.event]]) ~ QUANTILE, data = dat)
+  trend_pval <- 1 - pchisq(surv_diff$chisq, length(surv_diff$n) - 1)
+  
+  legend.labs <- str_split_fixed(names(fit.quantile$strata), "=", 2)[, 2]
+  p <- ggsurvplot(fit.quantile, dat, 
+                  pval = sprintf("p = %.2e", trend_pval),
+                  size = 1,
+                  xlab = ifelse(is.null(xlab), "Time (Months)", xlab),
+                  ylab = paste("Probability"),
+                  legend.labs = legend.labs, 
+                  legend.title = exp,  # 只显示exp作为标题
+                  surv.median.line = "hv",
+                  censor.shape = 124, 
+                  censor.size = 3,
+                  risk.table = TRUE,
+                  risk.table.title = "",
+                  tables.col = "black",
+                  tables.theme = theme_cleantable(),
+                  ggtheme = theme_bw(),
+                  palette = "npg")  # 使用Nature配色方案
+  
+  p$plot <- p$plot + theme(axis.title.y = element_text(margin = margin(0,-6,0,4)),
+                           legend.text = element_text(size = rel(1)))  # 增大图例文字大小
+  p$plot$theme$legend.margin <- margin(0,0,-5,0)
+  p$plot$theme$plot.margin <- margin(15,6,0,6)
+  p$table$theme$plot.margin <- margin(-10,0,0,0)
+  p <- ggpubr::ggarrange(p$plot, p$table, heights = c(4, 1), ncol = 1, nrow = 2, align = "v")
+  # 更新文件名
+  filename <- sprintf("%s_%s_Q%d_QUANTILE.png",
+                      exp, rsp.time,
+                      n_quantiles)  # 使用实际的分位数
+  ggsave(file.path(root, "Picture", "ER_plot", filename), p, height=6, width=6, dpi=1000)
+  return(p)}
+
+#102+101 PFS
+P2<-Surv_strata(data_EFF_adc_101_102, 'Cavg_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_adc_101_102, 'AUCFD_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_adc_101_102, 'CminFD_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_adc_101_102, 'AUCss_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_adc_101_102, 'Cminss_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'PFS_ADC_101_102.png'), p_final, width = 15, height = 10)
+
+P2<-Surv_strata(data_EFF_toxin_101_102, 'Cavg_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_toxin_101_102, 'AUCFD_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_toxin_101_102, 'CminFD_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_toxin_101_102, 'AUCss_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_toxin_101_102, 'Cminss_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'PFS_TOXIN_101_102.png'), p_final, width = 15, height = 10)
+
+#309 PFS
+P2<-Surv_strata(data_EFF_adc_309, 'Cavg_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_adc_309, 'AUCFD_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_adc_309, 'CminFD_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_adc_309, 'AUCss_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_adc_309, 'Cminss_ADC', 'PFS', 'PFS_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'PFS_ADC_309.png'), p_final, width = 15, height = 10)
+
+P2<-Surv_strata(data_EFF_toxin_309, 'Cavg_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_toxin_309, 'AUCFD_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_toxin_309, 'CminFD_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_toxin_309, 'AUCss_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_toxin_309, 'Cminss_TOXIN', 'PFS', 'PFS_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'PFS_TOXIN_309.png'), p_final, width = 15, height = 10)
+
+#309 OS
+P2<-Surv_strata(data_EFF_adc_309, 'Cavg_ADC', 'OS', 'OS_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_adc_309, 'AUCFD_ADC', 'OS', 'OS_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_adc_309, 'CminFD_ADC', 'OS', 'OS_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_adc_309, 'AUCss_ADC', 'OS', 'OS_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_adc_309, 'Cminss_ADC', 'OS', 'OS_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'OS_ADC.png'), p_final, width = 15, height = 10)
+
+P2<-Surv_strata(data_EFF_toxin_309, 'Cavg_TOXIN', 'OS', 'OS_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_toxin_309, 'AUCFD_TOXIN', 'OS', 'OS_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_toxin_309, 'CminFD_TOXIN', 'OS', 'OS_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_toxin_309, 'AUCss_TOXIN', 'OS', 'OS_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_toxin_309, 'Cminss_TOXIN', 'OS', 'OS_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'OS_TOXIN.png'), p_final, width = 15, height = 10)
+
+#102+101 DOR
+P2<-Surv_strata(data_EFF_adc_101_102, 'Cavg_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_adc_101_102, 'AUCFD_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_adc_101_102, 'CminFD_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_adc_101_102, 'AUCss_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_adc_101_102, 'Cminss_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'DOR_ADC_101_102.png'), p_final, width = 15, height = 10)
+
+P2<-Surv_strata(data_EFF_toxin_101_102, 'Cavg_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_toxin_101_102, 'AUCFD_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_toxin_101_102, 'CminFD_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_toxin_101_102, 'AUCss_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_toxin_101_102, 'Cminss_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'DOR_Toxin_101_102.png'), p_final, width = 15, height = 10)
+
+#309 DOR
+P2<-Surv_strata(data_EFF_adc_309, 'Cavg_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_adc_309, 'AUCFD_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_adc_309, 'CminFD_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_adc_309, 'AUCss_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_adc_309, 'Cminss_ADC', 'DOR', 'DOR_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'DOR_ADC_309.png'), p_final, width = 15, height = 10)
+
+P2<-Surv_strata(data_EFF_toxin_309, 'Cavg_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P3<-Surv_strata(data_EFF_toxin_309, 'AUCFD_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P4<-Surv_strata(data_EFF_toxin_309, 'CminFD_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P5<-Surv_strata(data_EFF_toxin_309, 'AUCss_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+P6<-Surv_strata(data_EFF_toxin_309, 'Cminss_TOXIN', 'DOR', 'DOR_CENS', n_quantiles = 4)
+p_final <- ggpubr::ggarrange(P2,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'DOR_DRUG_309.png'), p_final, width = 15, height = 10)
+
+
+
+# 安全性分析--------------------------
+# G3 above TRAE
+P1<- plot_ER(data_sf_adc,'G3_P_AE','Cavg_G3_P_AE', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+#P2<- plot_ER(data_sf_adc,'G3_P_AE','Cavg_ADC', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'G3_P_AE','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'G3_P_AE','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'G3_P_AE','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'G3_P_AE','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'G3_P_AE_ADC_sum.png'), p_final, width = 18, height = 12)
+
+P1<- plot_ER(data_sf_toxin,'G3_P_AE','Cavg_G3_P_AE', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+#P2<- plot_ER(data_sf_toxin,'G3_P_AE','Cavg_TOXIN', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'G3_P_AE','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'G3_P_AE','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'G3_P_AE','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'G3_P_AE','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'G3_P_AE_toxin_sum.png'), p_final, width = 18, height = 12)
+
+# SAE
+P1<- plot_ER(data_sf_adc,'SAE','Cavg_SAE', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+#P2<- plot_ER(data_sf_adc,'SAE','Cavg_ADC', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'SAE','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'SAE','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'SAE','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'SAE','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'SAE_ADC_sum.png'), p_final, width = 18, height = 12)
+
+P1<- plot_ER(data_sf_toxin,'SAE','Cavg_SAE', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+#P2<- plot_ER(data_sf_toxin,'SAE','Cavg_TOXIN', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'SAE','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'SAE','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'SAE','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'SAE','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'SAE_toxin_sum.png'), p_final, width = 18, height = 12)
+
+# ANEMIA_G3_P
+P1<- plot_ER(data_sf_adc,'ANEMIA_G3_P','Cavg_ANEMIA_G3_P', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+#P2<- plot_ER(data_sf_adc,'ANEMIA_G3_P','Cavg_ADC', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'ANEMIA_G3_P','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'ANEMIA_G3_P','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'ANEMIA_G3_P','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'ANEMIA_G3_P','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'ANEMIA_G3_P_ADC_sum.png'), p_final, width = 20, height = 13)
+
+P1<- plot_ER(data_sf_toxin,'ANEMIA_G3_P','Cavg_ANEMIA_G3_P', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+#P2<- plot_ER(data_sf_toxin,'ANEMIA_G3_P','Cavg_TOXIN', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'ANEMIA_G3_P','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'ANEMIA_G3_P','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'ANEMIA_G3_P','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'ANEMIA_G3_P','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'ANEMIA_G3_P_toxin_sum.png'), p_final, width = 20, height = 13)
+
+# PLTD_G3_P
+P1<- plot_ER(data_sf_adc,'PLTD_G3_P','Cavg_PLTD_G3_P', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'PLTD_G3_P','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'PLTD_G3_P','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'PLTD_G3_P','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'PLTD_G3_P','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'PLTD_G3_P_ADC_sum.png'), p_final, width = 20, height = 13)
+
+P1<- plot_ER(data_sf_toxin,'PLTD_G3_P','Cavg_PLTD_G3_P', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'PLTD_G3_P','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'PLTD_G3_P','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'PLTD_G3_P','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'PLTD_G3_P','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'PLTD_G3_P_toxin_sum.png'), p_final, width = 20, height = 13)
+
+# HEMA_G3_P
+P1<- plot_ER(data_sf_adc,'HEMA_G3_P','Cavg_HEMA_G3_P', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'HEMA_G3_P','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'HEMA_G3_P','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'HEMA_G3_P','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'HEMA_G3_P','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'HEMA_G3_P_ADC_sum.png'), p_final, width = 20, height = 13)
+
+P1<- plot_ER(data_sf_toxin,'HEMA_G3_P','Cavg_HEMA_G3_P', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'HEMA_G3_P','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'HEMA_G3_P','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'HEMA_G3_P','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'HEMA_G3_P','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'HEMA_G3_P_toxin_sum.png'), p_final, width = 20, height = 13)
+
+# GI
+P1<- plot_ER(data_sf_adc,'GI','Cavg_GI', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'GI','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'GI','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'GI','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'GI','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'GI_ADC_sum.png'), p_final, width = 20, height = 13)
+
+P1<- plot_ER(data_sf_toxin,'GI','Cavg_GI', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'GI','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'GI','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'GI','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'GI','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'GI_toxin_sum.png'), p_final, width = 20, height = 13)
+
+
+# ILD
+P1<- plot_ER(data_sf_adc,'ILD','Cavg_ILD', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'ILD','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'ILD','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'ILD','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'ILD','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'ILD_ADC_sum.png'), p_final, width = 20, height = 13)
+
+P1<- plot_ER(data_sf_toxin,'ILD','Cavg_ILD', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'ILD','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'ILD','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'ILD','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'ILD','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'ILD_toxin_sum.png'), p_final, width = 20, height = 13)
+
+
+# WITHDRAWN
+P1<- plot_ER(data_sf_adc,'WITHDRAWN','Cavg_WITHDRAWN', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'WITHDRAWN','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'WITHDRAWN','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'WITHDRAWN','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'WITHDRAWN','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'WITHDRAWN_ADC_sum.png'), p_final, width = 20, height = 13)
+
+P1<- plot_ER(data_sf_toxin,'WITHDRAWN','Cavg_WITHDRAWN', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'WITHDRAWN','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'WITHDRAWN','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'WITHDRAWN','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'WITHDRAWN','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'WITHDRAWN_toxin_sum.png'), p_final, width = 20, height = 13)
+
+# REDUCT
+P1<- plot_ER(data_sf_adc,'REDUCT','Cavg_REDUCT', 'Cavg of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_adc,'REDUCT','AUCFD_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_adc,'REDUCT','CmaxFD_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_adc,'REDUCT','AUCss_ADC', 'AUC of ADC (day*ug/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_adc,'REDUCT','Cmaxss_ADC', 'Cmax of ADC (ug/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6,  ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'REDUCT_ADC_sum.png'), p_final, width = 20, height = 13)
+
+P1<- plot_ER(data_sf_toxin,'WITHDRAWN','Cavg_REDUCT', 'Cavg of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P3<- plot_ER(data_sf_toxin,'WITHDRAWN','AUCFD_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P4<- plot_ER(data_sf_toxin,'WITHDRAWN','CmaxFD_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+P5<- plot_ER(data_sf_toxin,'WITHDRAWN','AUCss_TOXIN', 'AUC of toxin (day*ng/ml)', 'Probility', 'DOGROUP')
+P6<- plot_ER(data_sf_toxin,'WITHDRAWN','Cmaxss_TOXIN', 'Cmax of toxin (ng/ml)', 'Probility', 'DOGROUP')
+p_final <- ggpubr::ggarrange(P1,P3,P4,P5,P6, ncol = 3, nrow = 2)
+ggsave(file.path(root, "Picture", "ER_plot", 'REDUCT_toxin_sum.png'), p_final, width = 20, height = 13)
+
+
+
+# 协变量筛选
+# 数据处理：连续性变量转换为数字型，分类变量转换为因子型
+data_EFF_adc_101_102_processed <- data_EFF_adc_101_102 %>%
+  filter(across(all_of(c('AGE', 'BW', 'ALB', 'RACE', 'ECOG', 'SOD_B', 'IHC', 'HER2T', 'NST',  'LM', 'BM')), 
+                ~ . != -999)) %>%
+  mutate(Cminss_ADC = as.numeric(Cminss_ADC))
+
+data_EFF_adc_309_processed <- data_EFF_adc_309 %>%
+  filter(across(all_of(c('AGE', 'BW', 'ALB', 'RACE', 'ECOG', 'SOD_B', 'IHC', 'HER2T', 'NST',  'LM', 'BM', 'PLP')), 
+                ~ . != -999)) %>%
+  mutate(PFS= as.numeric(PFS), Cminss_ADC = as.numeric(Cminss_ADC), AUCFD_ADC = as.numeric(AUCFD_ADC),
+         OS = as.numeric(OS), Cavg_ADC = as.numeric(Cavg_ADC))
+
+# 有效性协变量
+covct <- c('AGE', 'SOD_B', 'BW', 'ALB')
+covca <- c('ECOG', 'IHC', 'PERTU', 'NST', 'LM', 'BM', 'RACE')
+covca1 <- c('ECOG', 'IHC', 'PERTU', 'NST', 'LM', 'PLP') # 309 有转移部位
+
+# 协变量筛选函数，model_type 可选glm和cox
+covariate_selection <- function(base_formula, data, covct, covca, alpha_forward = 0.05, alpha_backward = 0.01, model_type='glm') {
+  # 基础Cox模型
+  if (model_type =='glm') {
+    base_model <- glm(as.formula(base_formula), family = "binomial", data = data)}
+  else if (model_type =='cox'){
+    base_model <- coxph(as.formula(base_formula), data = data)}
+  
+  # 获取基础公式中的变量
+  base_vars <- all.vars(as.formula(base_formula))
+  base_vars <- base_vars[base_vars != "Surv"] # 移除Surv函数
+  
+  # 向前筛选
+  print("=== 向前筛选阶段 (alpha = 0.05) ===")
+  current_formula <- base_formula
+  added_vars <- character(0)
+  all_covariates <- c(covct, covca)
+  
+  repeat {
+    best_p <- Inf
+    best_var <- NULL
+    
+    # 测试所有未添加的协变量
+    for (var in all_covariates) {
+      if (!var %in% added_vars && var %in% names(data)) {
+        if (sum(!is.na(data[[var]])) > 0) {
+          # 构建包含协变量的模型
+          new_formula <- paste0(current_formula, " + ", var)
+          if (model_type =='glm') {new_model <- glm(as.formula(new_formula), family = "binomial", data = data)}
+          else if (model_type =='cox'){new_model <- coxph(as.formula(new_formula), data = data)}
+          
+          # ANOVA检验
+          anova_result <- anova(base_model, new_model, test = "Chisq")
+          p_val <- anova_result[nrow(anova_result), ncol(anova_result)]
+          
+          print(paste0(new_formula,  ",p值:", p_val))
+          if (!is.na(p_val) && p_val < best_p) {
+            best_p <- p_val
+            best_var <- var
+          }
+        }
+      }
+    }
+    
+    # 如果找到显著变量，添加到模型中
+    if (!is.null(best_var) && best_p < alpha_forward) {
+      current_formula <- paste0(current_formula, " + ", best_var)
+      added_vars <- c(added_vars, best_var)
+      
+      if (model_type =='glm') {
+        base_model <- glm(as.formula(current_formula), family = "binomial", data = data)}
+      else if (model_type =='cox'){
+        base_model <- coxph(as.formula(current_formula), data = data)}
+      
+      print(paste("添加变量:", best_var, "p值:", round(best_p, 4)))
+    } else {
+      break
+    }
+  }
+  
+  print(paste("向前筛选完成，最终模型:", current_formula))
+  
+  # 向后筛选
+  if (length(added_vars) > 0) {
+    print("=== 向后筛选阶段 (alpha = 0.01) ===")
+    
+    repeat {
+      if (length(added_vars) == 0) break
+      
+      worst_p <- 0
+      worst_var <- NULL
+      
+      # 测试当前模型中的每个协变量
+      for (var in added_vars) {
+        # 构建移除该变量的模型
+        temp_vars <- added_vars[added_vars != var]
+        if (length(temp_vars) > 0) {
+          reduced_formula <- paste0(base_formula, " + ", paste(temp_vars, collapse = " + "))
+        } else {
+          reduced_formula <- base_formula
+        }
+        
+        if (model_type =='glm') {
+          reduced_model <- glm(as.formula(reduced_formula), family = "binomial", data = data)}
+        else if (model_type =='cox'){
+          reduced_model <- coxph(as.formula(reduced_formula), data = data)}
+        
+        # ANOVA检验
+        anova_result <- anova(reduced_model, base_model, test = "Chisq")
+        p_val <- anova_result[nrow(anova_result), ncol(anova_result)]
+        
+        if (!is.na(p_val) && p_val > worst_p) {
+          worst_p <- p_val
+          worst_var <- var
+        }
+      }
+      
+      # 如果最不显著的变量p值大于alpha_backward，则移除
+      if (!is.null(worst_var) && worst_p > alpha_backward) {
+        added_vars <- added_vars[added_vars != worst_var]
+        if (length(added_vars) > 0) {
+          current_formula <- paste0(base_formula, " + ", paste(added_vars, collapse = " + "))
+        } else {
+          current_formula <- base_formula
+        }
+        
+        if (model_type =='glm') {
+          base_model <- glm(as.formula(current_formula), family = "binomial", data = data)}
+        else if (model_type =='cox'){
+          base_model <- coxph(as.formula(current_formula), data = data)}
+        
+        
+        print(paste("移除变量:", worst_var, "p值:", round(worst_p, 4)))
+      } else {
+        break
+      }
+    }
+  }
+  
+  print(paste("最终模型:", current_formula))
+  
+  # 返回最终模型
+  if (model_type =='glm') {
+    final_model <- glm(as.formula(current_formula), family = "binomial", data = data)}
+  else if (model_type =='cox'){
+    final_model <- coxph(as.formula(current_formula), data = data)}
+  
+  return(list(
+    formula = current_formula,
+    model = final_model,
+    added_vars = added_vars
+  ))
+}
+
+
+# 协变量筛选-101/102研究OR
+covariate_results <- covariate_selection('OR~Cminss_ADC', data_EFF_adc_101_102_processed, covct, covca)
+# 协变量筛选-309研究OR
+covariate_results <- covariate_selection('OR~Cavg_ADC', data_EFF_adc_309_processed, covct, covca1)
+# 309 PFS
+cox_covariate_results <- covariate_selection('Surv(PFS, PFS_CENS) ~ AUCFD_ADC', data_EFF_adc_309_processed, covct, covca1, model_type ='cox')
+# 309 OS
+cox_covariate_results <- covariate_selection('Surv(OS, OS_CENS) ~ Cminss_ADC', data_EFF_adc_309_processed, covct, covca, model_type ='cox')
+
+
+# 安全性协变量
+covct <- c('AGE', 'SOD_B', 'BW', 'ALB', 'AST', 'TBIL', 'CLCR', 'PLAT', 'HGB', 'NEUT')
+covca <- c('ECOG', 'LM', 'BM', 'HER2E', 'RTH', 'CT', 'NST')
+
+data_sf_toxin_processed <- data_sf_toxin %>%
+  filter(across(all_of(c('AGE', 'SOD_B', 'BW', 'ALB', 'AST', 'TBIL', 'CLCR', 'PLAT', 'HGB', 'NEUT', 'ECOG', 'LM', 'BM', 'HER2E', 'RTH', 'CT', 'NST')), 
+                ~ . != -999))
+
+# 协变量筛选-G3PAE_CAVG
+covariate_results <- covariate_selection('G3_P_AE~Cavg_G3_P_AE', data_sf_toxin_processed, covct, covca)
+covariate_results <- covariate_selection('SAE~Cavg_SAE', data_sf_toxin, covct, covca)
+covariate_results <- covariate_selection('ANEMIA_G3_P~Cavg_ANEMIA_G3_P', data_sf_toxin, covct, covca)
+covariate_results <- covariate_selection('HEMA_G3_P~Cavg_HEMA_G3_P', data_sf_toxin, covct, covca)
+covariate_results <- covariate_selection('PLTD_G3_P~Cavg_PLTD_G3_P', data_sf_toxin, covct, covca)
+covariate_results <- covariate_selection('GI~Cavg_GI', data_sf_toxin, covct, covca)
+covariate_results <- covariate_selection('REDUCT~Cavg_REDUCT', data_sf_adc, covct, covca)
+covariate_results <- covariate_selection('WITHDRAWN~Cavg_WITHDRAWN', data_sf_adc, covct, covca)
+
+
+# 创建风险预测函数（包含置信区间）
+predict_risk_with_ci <- function(model, pred_data, confidence_level = 0.90, model_type='glm') {
+  # 使用提供的pred_data进行预测
+  if (model_type=='glm'){
+    risk_prediction <- predict(model, newdata = pred_data, type = "response", se.fit = TRUE)
+  } else{
+    risk_prediction <- predict(model, newdata = pred_data, type = "risk", se.fit = TRUE)
+  }
+  
+  
+  # 计算置信区间
+  z_value <- qnorm((1 + confidence_level) / 2)  # 95% CI对应1.96
+  
+  # 风险值的置信区间（基于log-scale）
+  log_risk <- risk_prediction$fit
+  log_se <- risk_prediction$se.fit
+  
+  lower_ci <- log_risk - z_value * log_se
+  upper_ci <- log_risk + z_value * log_se
+  
+  return(list(
+    risk = risk_prediction$fit,
+    lower_ci = lower_ci,
+    upper_ci = upper_ci,
+    se = risk_prediction$se.fit
+  ))
+}
+# 计算风险比值和置信区间的函数
+calculate_risk_ratios <- function(model, reference_values, comparison_scenarios) {
+  # 计算参考情况的风险
+  # 直接使用reference_values
+  ref_result <- predict_risk_with_ci(model, reference_values)
+  
+  # 存储结果
+  results_table <- data.frame(
+    Scenario = character(),
+    Risk = numeric(),
+    mid = numeric(),
+    lower = numeric(),
+    upper = numeric(),
+    midlabel = character(),
+    lowerlabel = character(),
+    upperlabel = character(),
+    LABEL = character(),
+    covname = character(),
+    label = character(),
+    stringsAsFactors = FALSE
+  )
+  
+  # 计算其他情况的风险比值
+  for (i in 1:nrow(comparison_scenarios)) {
+    scenario <- comparison_scenarios[i, ]
+    
+    # 计算当前情况的风险
+    # 直接截取当前场景的所有列
+    curr_pred_data <- scenario
+    
+    curr_result <- predict_risk_with_ci(model, curr_pred_data)
+    
+    # 计算风险比值
+    risk_ratio <- curr_result$risk / ref_result$risk
+    
+    # 计算风险比值的置信区间（直接用CI除以参考风险）
+    rr_lower <- curr_result$lower_ci / ref_result$risk
+    rr_upper <- curr_result$upper_ci / ref_result$risk
+    
+    # 比较scenario和reference_values，找出不同的变量名和值
+    covname <- character()
+    label <- character()
+    print(curr_result)
+    for (var_name in names(scenario)) {
+      if (var_name %in% names(reference_values)) {
+        if (scenario[[var_name]] != reference_values[[var_name]]) {
+          covname <- c(covname, var_name)
+          label <- c(label, as.character(scenario[[var_name]]))
+        }
+      }
+    }
+    
+    # 如果没有找到差异，使用默认值
+    if (length(covname) == 0) {
+      covname <- "No difference"
+      label <- "Reference"
+    } else {
+      # 将多个差异合并为一个字符串
+      covname <- paste(covname, collapse = " + ")
+      label <- paste(label, collapse = " vs ")
+    }
+    
+    # 添加到结果表
+    results_table <- rbind(results_table, data.frame(
+      Scenario = paste("Scenario", i),
+      Risk = curr_result$risk,
+      mid = risk_ratio,
+      lower = rr_lower,
+      upper = rr_upper,
+      midlabel = sprintf("%.2f", risk_ratio),
+      lowerlabel = sprintf("%.2f", rr_lower),
+      upperlabel = sprintf("%.2f", rr_upper),
+      LABEL = paste0(sprintf("%.2f", risk_ratio), "[", sprintf("%.2f", rr_lower), ", ", sprintf("%.2f", rr_upper), "]"),
+      covname = covname,
+      label = label
+    ))
+  }
+  
+  return(results_table)
+}
+# 森林图画图
+generate_forest_plot <- function(paramname, final_summary, save_plot = TRUE) {
+  # 筛选数据
+  plotdata <- final_summary %>% mutate(paramname = paramname)
+  
+  # 转换为因子
+  plotdata$label <- factor(plotdata$label)
+  plotdata$covname <- factor(plotdata$covname)
+  
+  # 生成森林图
+  p <- coveffectsplot::forest_plot(plotdata,
+                                   x_facet_text_size = 20,
+                                   y_facet_text_size = 20,
+                                   interval_legend_text = "Median (points)\n90% CI (horizontal lines)",
+                                   legend_order = c("pointinterval"),
+                                   xlabel = paste0('Fold~Change~of~Harzrd~Ratio~of~', paramname, '~Relative~to~Reference'),
+                                   x_range = c(0.4, 7),
+                                   parse_xlabel = T,
+                                   logxscale = TRUE, 
+                                   major_x_ticks = c(0.35, 1, 3, 7),
+                                   facet_formula = "covname~.",
+                                   facet_switch = "both",
+                                   facet_scales = "free",
+                                   facet_space = "fixed",
+                                   reserve_table_xaxis_label_space = F,
+                                   paramname_shape = F,
+                                   show_table_facet_strip = "none",
+                                   table_position = "right",
+                                   table_text_size = 6,
+                                   y_label_text_size = 20,
+                                   x_label_text_size = 20,
+                                   plot_table_ratio = 3,
+                                   legend_space_x_mult = 1,
+                                   return_list = FALSE,
+                                   legend_shape_reverse = F,
+                                   plot_margin = c(-10, 15, 1, 5.5),
+                                   table_margin = c(-10, 15, 1, 5.5),
+                                   legend_margin = c(-40, 0.1, -0.1, 0),
+                                   ref_area = FALSE,
+                                   ref_area_col = "transparent")
+  
+  # 保存图片
+  if (save_plot) {
+    # 创建目录（如果不存在）
+    dir.create("Picture/Forest_plot", recursive = TRUE, showWarnings = FALSE)
+    
+    # 生成文件名
+    filename <- paste0("cov_effect_", tolower(gsub("_", "", paramname)), ".png")
+    filepath <- paste0(root, "/Picture/Forest_plot/", filename)
+    
+    # 保存图片
+    ggsave(filepath, plot = p, scale = 15, width = 1, height = 0.618, units = "in", dpi = 500)
+    
+    cat("图片已保存到:", filepath, "\n")
+  }
+  
+  return(p)
+}
+
+
+#G3_P_AE~Cavg_G3_P_AE + AST + BW
+G3_P_AE_model <- glm(G3_P_AE ~ Cavg_G3_P_AE + AST + BW, family = "binomial", data = data_sf_toxin_processed)
+
+predict(G3_P_AE_model, newdata = reference_values, se.fit = TRUE)
+
+# 使用通用函数计算
+# Cavg_G3_P_AE分位数：0.39,0.61,0.80,1.11,2.15
+# AST分位数：15, 19, 24.9, 35, 57.54
+# BW 分位数：45.6，54，61，68，81.52
+
+probs = c(0.05, 0.25, 0.5, 0.75, 0.95)
+Cavg_G3_P_AE_result <-  quantile(data_sf_toxin_processed[["Cavg_G3_P_AE"]], probs = probs, na.rm = TRUE)
+AST_result <- quantile(data_sf_toxin_processed[["AST"]], probs = probs, na.rm = TRUE)
+WT_result <-  quantile(data_sf_toxin_processed[["BW"]], probs = probs, na.rm = TRUE)
+
+# 定义参考值和比较情况
+reference_values <- list(Cavg_G3_P_AE = 0.80, AST = 24.9, BW = 61)
+comparison_scenarios <- data.frame(
+  Cavg_G3_P_AE = c(0.39,0.61,1.11,2.15,0.80, 0.80,0.80,0.80,0.80,0.80,0.80,0.80),
+  AST = c(24.9,24.9,24.9,24.9,15, 19, 35, 57.54,24.9,24.9,24.9,24.9),
+  BW = c(61,61,61,61,61,61,61,61,45.6,54, 68,81.52),
+  stringsAsFactors = FALSE
+)
+risk_ratios_table <- calculate_risk_ratios(G3_P_AE_model, reference_values, comparison_scenarios) 
+risk_ratios_table <- risk_ratios_table %>% mutate(label = case_when(
+  label == 50.06~ '95th:50.06',
+  label == '1'~ '有肝转移',
+  label == '2'~ 'IHC2+',
+  label == 18.48~ '5th:18.48',
+  TRUE~label
+))
+p_PFS <- generate_forest_plot(paramname = "PFS", risk_ratios_table)
+
+
+#ANEMIA_G3_P~Cavg_ANEMIA_G3_P + HGB + NST + CT + ALB
+#HEMA_G3_P~Cavg_HEMA_G3_P + HGB + ALB + AST
+#PLTD_G3_P~Cavg_PLTD_G3_P + NST + RTH
+#GI~Cavg_GI + AST
+
+
+
+
+
+
+# 定义参考值和比较情况
+reference_values <- list(
+  CMINFD_ADC = 8.17,
+  IHC = '3'
+)
+comparison_scenarios <- data.frame(
+  CMINFD_ADC = c(8.17, 2.68, 14.71),
+  IHC = c('2', '3', '3'),
+  stringsAsFactors = FALSE
+)
+
+risk_ratios_table <- calculate_risk_ratios(DOR_model, reference_values, comparison_scenarios)
+risk_ratios_table <- risk_ratios_table %>% mutate(label = case_when(
+  label == 14.71~ '95th:14.71',
+  label == '2'~ 'IHC2+',
+  label == 2.68~ '5th:2.68',
+  TRUE~label
+))
+p_DOR <- generate_forest_plot("DOR", risk_ratios_table)
+risk_prediction <- predict(DOR_model, newdata = comparison_scenarios, type = "risk", se.fit = TRUE)
